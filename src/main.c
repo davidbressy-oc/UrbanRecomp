@@ -91,6 +91,7 @@ uint8_t    g_ram[0x20000];
  * a German ROM. It compiled and linked without a word. */
 #include "sc_mapview.h"
 #include "sc_launcher.h"
+#include "sc_gamepad.h"
 #include "sc_sram.h"
 #include "sc_icon.h"
 #include "sc_vehicles.h"
@@ -6549,10 +6550,10 @@ static void apply_frame_input(uint64_t frame) {
  * this recomp's C driver doesn't need), this ports just the destination
  * semantics: since we already have direct WRAM access every frame, skip
  * the serial-read entirely and drive the same two accumulator bytes from
- * the real host mouse instead. Upstream's own README calls this "lots of
- * jank" (menus visually desync until the D-pad is used, no button
- * support, occasional resets to origin) -- ported as-is, same caveats
- * apply here. Toggle with F3 (see SDL_SCANCODE_F3 above). */
+ * the real host mouse instead. Pointing now uses absolute presentation
+ * coordinates, restricted to the native city view. Full-width interactions
+ * and the ROM's own cursor relocation/clamp rules remain unresolved, so this
+ * stays experimental and opt-in. See docs/NATIVE_INPUT.md. Toggle with F3. */
 static bool s_mouse_enabled;
 
 /* Fast D-pad cursor (opt-in, F9): rather than reverse-engineer and patch
@@ -6581,8 +6582,8 @@ static bool s_fast_cursor_enabled;
  * px/frame (~4s to cross the screen). That is authentic behaviour, not a
  * recomp defect, and is presumably why the cartridge shipped with SNES
  * Mouse support. This host-side nudge is the practical remedy. */
-/* Mouse sensitivity, as a percentage applied after the window-scale divide.
- * 100 = one SNES pixel per SNES pixel of pointer travel. */
+/* Relative drag-pan sensitivity. Absolute pointing always uses the displayed
+ * pixel geometry; scaling it would break pointer/cursor correspondence. */
 static int s_mouse_sensitivity = 100;
 /* Direction the host mouse last moved, fed to the pad while a mouse button is
  * held so the ROM runs its own cursor/drag path instead of only seeing a
@@ -6967,7 +6968,7 @@ static SettingDesc s_settings[] = {
     kDragTurbos, (int)(sizeof(kDragTurbos) / sizeof(kDragTurbos[0])) },
   { "PAN SPEED",             kSettingCycle, &s_pan_max_tiles,       0,    NULL,
     kPanMaxTiles, (int)(sizeof(kPanMaxTiles) / sizeof(kPanMaxTiles[0])) },
-  { "MOUSE SPEED",           kSettingCycle, &s_mouse_sensitivity,   0,    NULL,
+  { "MOUSE PAN SPEED",           kSettingCycle, &s_mouse_sensitivity,   0,    NULL,
     kMouseSensitivities, (int)(sizeof(kMouseSensitivities) / sizeof(kMouseSensitivities[0])) },
   { "FAST CURSOR",           kSettingBool, &s_fast_cursor_enabled, 0,    NULL, NULL, 0 },
   { "CURSOR SPEED",          kSettingCycle, &s_fast_cursor_step,   0,    NULL,
@@ -9296,6 +9297,9 @@ int main(int argc, char **argv) {
       SDL_WINDOW_RESIZABLE | window_flags);
   if (!window) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
   ScSetWindowIcon(window);
+  ScGamepad gamepad;
+  ScGamepadInit(&gamepad, s_launch_settings.player1_guid,
+                s_launch_settings.player1_deadzone, "config.ini");
   /* No SDL_RENDERER_PRESENTVSYNC: on some hosts (observed under a VM) the
    * driver's vsync wait blocks for longer than one real display refresh
    * (e.g. ~33ms instead of ~16.67ms), silently halving the whole loop's
@@ -9448,7 +9452,7 @@ int main(int argc, char **argv) {
        * steer the game cursor unless asked for. */
       if (ev.type == SDL_KEYDOWN && SC_EVENT_SCANCODE(ev) == SDL_SCANCODE_F3 && !ev.key.repeat) {
         s_mouse_enabled = !s_mouse_enabled;
-        if (s_mouse_enabled) SDL_GetRelativeMouseState(NULL, NULL); /* discard stale accumulated delta */
+        /* Absolute sampling has no stale relative delta to discard. */
         fprintf(stderr, "[F3] mouse cursor control %s\n", s_mouse_enabled ? "ON" : "OFF");
       }
       /* F9: toggle the fast D-pad cursor (see apply_mouse_delta/
@@ -9597,146 +9601,10 @@ int main(int argc, char **argv) {
     bool scripted_input = getenv("SC_SCRIPTED_INPUT") != NULL;
     static const uint8_t empty_keys[512] = {0};
     if (scripted_input) keys = empty_keys;
-    /* Throw away the pointer delta that accumulated while the window was not
-     * ours.
-     *
-     * SDL_GetRelativeMouseState() reports movement since the LAST call, and
-     * it keeps accumulating while the window is unfocused or the pointer is
-     * outside it. Alt-tab away, move the mouse across the desktop, come back,
-     * and the next call returns that whole journey in one delta -- so the
-     * cursor jumps somewhere far from where the pointer actually is.
-     * Reported from play as the mouse "not on spot when the cursor gets back
-     * to the window".
-     *
-     * The F3 toggle already does exactly this discard for the same reason.
-     * This is that, on regaining focus or the pointer re-entering.
-     *
-     * Polled from the window flags rather than handled as an event, because
-     * the event spelling differs between SDL2 and SDL3 (SDL_WINDOWEVENT with
-     * a sub-type vs SDL_EVENT_WINDOW_*) while these two flags do not. This
-     * file has already been bitten three times by SDL2/SDL3 renames that keep
-     * compiling, so the version-neutral spelling is the safer one. */
-    { static bool had_focus = true;
-      const uint32_t wf = (uint32_t)SDL_GetWindowFlags(window);
-      const bool has_focus = (wf & (SDL_WINDOW_INPUT_FOCUS |
-                                    SDL_WINDOW_MOUSE_FOCUS)) != 0;
-      if (has_focus && !had_focus) {
-#if SNESRECOMP_SDL3
-        { float fx = 0.0f, fy = 0.0f; SDL_GetRelativeMouseState(&fx, &fy); }
-#else
-        SDL_GetRelativeMouseState(NULL, NULL);
-#endif
-      }
-      had_focus = has_focus; }
-    if (s_mouse_enabled && !scripted_input) {
-      /* SDL reports the pointer delta in HOST SCREEN pixels; the cursor lives
-       * in SNES pixels. Feeding one straight into the other made the cursor
-       * move `scale` times too fast -- 3x at the default window size. Reported
-       * from play as "the mouse input seems way too fast", on every region,
-       * not just the one it was noticed on.
-       *
-       * Divide by the live window scale rather than the `scale` variable, so a
-       * resized or fullscreened window stays correct. The remainder is carried
-       * rather than truncated, or slow movement below one SNES pixel per frame
-       * would be silently dropped and the cursor would feel sticky. */
-      /* SDL3 changed this to float* -- SDL_GetRelativeMouseState(float*,float*).
-       * Passing int* is not an error in MSVC C, only warning C4133, so it built
-       * clean under a grep that matched "error C" and the SDL3 build spent the
-       * whole time reinterpreting float bits as ints. The deltas were garbage,
-       * clamped to +/-127, which is why the cursor was "way too fast in every
-       * setting" -- no sensitivity could scale a nonsense number.
-       *
-       * Third time this family of change has bitten: SDL_Init returning bool,
-       * SDL_Rect becoming SDL_FRect, and now this. SDL_ENABLE_OLD_NAMES keeps
-       * the NAME working, which is exactly what makes it dangerous. */
-      int mdx = 0, mdy = 0;
-#if SNESRECOMP_SDL3
-      { float fx = 0.0f, fy = 0.0f;
-        SDL_GetRelativeMouseState(&fx, &fy);
-        mdx = (int)fx; mdy = (int)fy; }
-#else
-      SDL_GetRelativeMouseState(&mdx, &mdy);
-#endif
-      if (mdx || mdy) {
-        int ow = 0, oh = 0;
-#if SNESRECOMP_SDL3
-        SDL_GetRenderOutputSize(renderer, &ow, &oh);
-#else
-        SDL_GetRendererOutputSize(renderer, &ow, &oh);
-#endif
-        int window_w = 0, window_h = 0;
-        SDL_GetWindowSize(window, &window_w, &window_h);
-        double dpi_x = window_w > 0 ? (double)ow / window_w : 1;
-        double dpi_y = window_h > 0 ? (double)oh / window_h : 1;
-        double sx = s_destination.w > 0 ? (double)s_destination.w / viewport.width / dpi_x : scale;
-        double sy = s_destination.h > 0 ? (double)s_destination.h / viewport.height / dpi_y : scale;
-        if (sx < 1.0) sx = 1.0;
-        if (sy < 1.0) sy = 1.0;
-        const double sens = (double)s_mouse_sensitivity / 100.0;
-        static double acc_x, acc_y;
-        acc_x += (double)mdx * sens / sx;
-        acc_y += (double)mdy * sens / sy;
-        int step_x = (int)acc_x, step_y = (int)acc_y;
-        acc_x -= step_x; acc_y -= step_y;
-        /* Right button held = pan the map, not move the cursor.
-         *
-         * That mirrors what the ROM itself does: holding A deactivates the
-         * cursor and turns the D-pad into a map scroll (01:afbe's ladder over
-         * $01bd/$01bf). Driving $01eb/$01ed while the game is trying to scroll
-         * fought that routine -- the direction arrows appeared but only the
-         * cursor moved.
-         *
-         * $01bd/$01bf are the confirmed scroll pair, clamped by 01:a0c4
-         * against bounds in $01c5-$01cb, which are read here rather than
-         * assumed. Scroll is in map tiles, so the SNES-pixel delta is divided
-         * down; SC_PAN_DIV tunes it. */
-        if (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
-          /* Pan by driving the ROM's OWN scroll, not by poking $01bd/$01bf.
-           *
-           * Writing the scroll pair directly tore the map even at one tile per
-           * frame, because the ROM updates its tilemap in step with that value
-           * during its own frame work -- a host write lands at an arbitrary
-           * point and the map redraws half-updated.
-           *
-           * Holding A is exactly the game's own "deactivate cursor, move the
-           * map" mode (01:8d8a -> 01:afbe). Synthesising A plus a direction
-           * makes the ROM scroll itself, so the update is coordinated and
-           * tear-free by construction, at whatever rate the game supports. */
-          static double pacc_x, pacc_y;
-          static int pan_div = -1;
-          if (pan_div < 0) {
-            const char *e = getenv("SC_PAN_DIV");
-            pan_div = (e && *e) ? atoi(e) : 8;
-            if (pan_div < 1) pan_div = 1;
-          }
-          pacc_x += (double)step_x / pan_div;
-          pacc_y += (double)step_y / pan_div;
-          int px = (int)pacc_x, py = (int)pacc_y;
-          pacc_x -= px; pacc_y -= py;
-          s_pan_dir = 0;
-          if (px < 0) s_pan_dir |= kPad_Left;
-          if (px > 0) s_pan_dir |= kPad_Right;
-          if (py < 0) s_pan_dir |= kPad_Up;
-          if (py > 0) s_pan_dir |= kPad_Down;
-          if (s_pan_dir) s_pan_dir_frames = 2;
-        } else if (step_x || step_y) {
-          apply_mouse_delta(step_x, step_y);
-          /* Remember the direction of travel. While a button is held the ROM
-           * needs to see the cursor MOVE through its own path -- poking
-           * $01eb/$01ed behind its back moves the sprite but never raises the
-           * "cursor moved" event its drag handling keys off, which is why
-           * holding the button only acted once instead of continuously. The
-           * synthesised d-pad below closes that gap. */
-          s_mouse_dir = 0;
-          if (step_x < 0) s_mouse_dir |= kPad_Left;
-          if (step_x > 0) s_mouse_dir |= kPad_Right;
-          if (step_y < 0) s_mouse_dir |= kPad_Up;
-          if (step_y > 0) s_mouse_dir |= kPad_Down;
-          s_mouse_dir_frames = 2;   /* survive a frame the pointer did not move */
-        }
-      }
-    }
-    if (s_fast_cursor_enabled) {
+    if (s_fast_cursor_enabled && host_map_screen_live() && !s_menu_open &&
+        !s_replay_open && !scripted_input &&
+        (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) &&
+        (!s_custom_video.enabled || !s_custom_renderer.advisor_frame)) {
       /* Host-driven, independent of the ROM's own cadence -- see
        * s_fast_cursor_enabled's comment above. Diagonal holds add both
        * axes, same as the ROM's own D-pad would. */
@@ -9803,6 +9671,92 @@ int main(int argc, char **argv) {
      * Select press into the game every time a state is saved/loaded. */
     if (keys[sc_select]) input |= kPad_Select;
     }   /* fixed bindings */
+    if (s_launch_settings.player1_source == 0) input = 0;
+    if (s_launch_settings.player1_source == 2)
+      input |= (uint16_t)ScGamepadRead(&gamepad);
+    /* Absolute pointer sampling uses window coordinates converted to drawable
+     * pixels, then the actual presented native-view anchor. No remainder or
+     * relative-motion accumulator survives focus, resize or state changes.
+     * Ownership changes only on pointer motion/click; an idle OS pointer must
+     * not undo keyboard/gamepad movement. This remains opt-in until the native
+     * engine's widened interaction path is implemented (docs/NATIVE_INPUT.md).
+     */
+    const Uint32 input_flags = SDL_GetWindowFlags(window);
+    const bool input_focus = (input_flags & SDL_WINDOW_INPUT_FOCUS) != 0;
+    const bool pointer_focus = input_focus && (input_flags & SDL_WINDOW_MOUSE_FOCUS) != 0;
+    static double last_pointer_x, last_pointer_y;
+    static bool pointer_sample, pointer_owned;
+    static double s_pointer_pan_x, s_pointer_pan_y;
+    static int s_pointer_pan_div;
+    if (!s_pointer_pan_div) {
+      const char *value = getenv("SC_PAN_DIV");
+      s_pointer_pan_div = value ? atoi(value) : 8;
+      if (s_pointer_pan_div < 1) s_pointer_pan_div = 1;
+    }
+    double pointer_x, pointer_y;
+#if SNESRECOMP_SDL3
+    { float x, y; SDL_GetMouseState(&x, &y); pointer_x = x; pointer_y = y; }
+#else
+    { int x, y; SDL_GetMouseState(&x, &y); pointer_x = x; pointer_y = y; }
+#endif
+    const Uint32 pointer_buttons = SDL_GetMouseState(NULL, NULL);
+    const bool pointer_moved = pointer_sample &&
+      (pointer_x != last_pointer_x || pointer_y != last_pointer_y);
+    const double pointer_dx = pointer_sample ? pointer_x - last_pointer_x : 0;
+    const double pointer_dy = pointer_sample ? pointer_y - last_pointer_y : 0;
+    last_pointer_x = pointer_x; last_pointer_y = pointer_y;
+    pointer_sample = pointer_focus;
+    int window_w, window_h, pointer_gx = 0, pointer_gy = 0;
+    SDL_GetWindowSize(window, &window_w, &window_h);
+    ScViewport pointer_view = s_custom_video.enabled ? s_custom_renderer.view : viewport;
+    const bool pointer_native = window_w > 0 && window_h > 0 &&
+      ScVideoToGuest(pointer_view, s_destination,
+        pointer_x * drawable_w / window_w, pointer_y * drawable_h / window_h,
+        &pointer_gx, &pointer_gy);
+    const bool pointer_map = host_map_screen_live() &&
+      (g_ppu->screenEnabled[0] & 2) != 0 &&
+      (!s_custom_video.enabled || (s_custom_renderer.city_frame &&
+                                   !s_custom_renderer.advisor_frame));
+    const bool pointer_active = s_mouse_enabled && pointer_focus && pointer_map &&
+      !s_menu_open && !s_replay_open && !scripted_input;
+    if (!pointer_active || !pointer_native || input) pointer_owned = false;
+    if (pointer_active && pointer_native && (pointer_moved || pointer_buttons))
+      pointer_owned = true;
+    if (pointer_owned) {
+      if (pointer_buttons & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
+        /* Panning is relative by definition, but its remainder belongs only
+         * to this uninterrupted drag, never to a future focus/device/session. */
+        const double sens = (double)s_mouse_sensitivity / 100.0;
+        s_pointer_pan_x += pointer_dx * drawable_w / window_w *
+          pointer_view.width / s_destination.w * sens / s_pointer_pan_div;
+        s_pointer_pan_y += pointer_dy * drawable_h / window_h *
+          pointer_view.height / s_destination.h * sens / s_pointer_pan_div;
+        int px = (int)s_pointer_pan_x, py = (int)s_pointer_pan_y;
+        s_pointer_pan_x -= px; s_pointer_pan_y -= py;
+        s_pan_dir = 0;
+        if (px < 0) s_pan_dir |= kPad_Left;
+        if (px > 0) s_pan_dir |= kPad_Right;
+        if (py < 0) s_pan_dir |= kPad_Up;
+        if (py > 0) s_pan_dir |= kPad_Down;
+        if (s_pan_dir) s_pan_dir_frames = 2;
+      } else {
+        s_pointer_pan_x = s_pointer_pan_y = 0;
+        const int dx = pointer_gx - (int)g_ram[0x01eb];
+        const int dy = pointer_gy - (int)g_ram[0x01ed];
+        g_ram[0x01eb] = (uint8_t)pointer_gx;
+        g_ram[0x01ed] = (uint8_t)pointer_gy;
+        s_mouse_dir = 0;
+        if (dx < 0) s_mouse_dir |= kPad_Left;
+        if (dx > 0) s_mouse_dir |= kPad_Right;
+        if (dy < 0) s_mouse_dir |= kPad_Up;
+        if (dy > 0) s_mouse_dir |= kPad_Down;
+        s_mouse_dir_frames = pointer_moved && s_mouse_dir ? 2 : 0;
+      }
+    } else {
+      s_mouse_dir_frames = 0;
+      s_pan_dir_frames = 0;
+      s_pointer_pan_x = s_pointer_pan_y = 0;
+    }
     /* Mouse buttons: LEFT = SNES B, RIGHT = SNES A.
      *
      * Lets host-mouse cursor control (F3) actually select and interact, not
@@ -9816,35 +9770,20 @@ int main(int argc, char **argv) {
      * Note these are the SERIAL-order pad bits (kPad_B = $0001, kPad_A =
      * $0100), not the $4218/$4219 hardware layout -- see
      * docs/HANDOVER_metal_marines.md #1. */
-    { const uint32_t mb = SDL_GetMouseState(NULL, NULL);
-      /* On a MENU, feed the synthesised d-pad without waiting for a button.
-       *
-       * apply_mouse_delta() pokes $01eb/$01ed, and that is what moves the
-       * cursor in the city view. On the menu pages it does nothing: they
-       * track their own selection, and moving the pointer left the last
-       * d-pad choice selected. Reported from play three ways -- the mouse
-       * not activating buttons in the tax menu, not working on normal menus,
-       * and working only while a button is held. The last one is the tell:
-       * holding LEFT is what lets the synthesised direction through here,
-       * and the direction is the only thing a menu reacts to.
-       *
-       * Not fed unconditionally, because in the city view the poke ALREADY
-       * moves the cursor -- adding the d-pad there would move it twice per
-       * frame. host_map_screen_live() is the existing discriminator: it is
-       * false for exactly the pages that report $14 == 0 without BG2, which
-       * are the menu pages this is for. */
-      const bool mouse_on_menu = !host_map_screen_live();
+    { const uint32_t mb = pointer_focus && !s_menu_open && !s_replay_open &&
+        (!s_mouse_enabled || !pointer_map || (pointer_native && pointer_owned))
+        ? pointer_buttons : 0;
+      /* The game's drag path needs direction events in addition to absolute
+       * placement. Never feed motion into native menus or advisor pages. */
       if (s_mouse_enabled && s_mouse_dir_frames > 0 &&
-          ((mb & SDL_BUTTON(SDL_BUTTON_LEFT)) || mouse_on_menu)) {
+          (mb & SDL_BUTTON(SDL_BUTTON_LEFT))) {
         input |= s_mouse_dir;
         s_mouse_dir_frames--;
       } else if (s_mouse_dir_frames > 0) {
         s_mouse_dir_frames--;
       }
       if (mb & SDL_BUTTON(SDL_BUTTON_LEFT))  input |= kPad_B;
-      /* Right button drives the map pan directly (see the pan block in the
-       * mouse handler) rather than feeding A, so it does not also trigger the
-       * ROM's own hold-A scroll and double up. */
+      /* A plus directions drives the ROM's coordinated map pan. */
       if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
         input |= kPad_A;                      /* the game's own pan modifier */
         if (s_pan_dir_frames > 0) { input |= s_pan_dir; s_pan_dir_frames--; }
@@ -9854,7 +9793,7 @@ int main(int argc, char **argv) {
      * SNES D-pad and Start bindings. The game is frozen so nothing acts on
      * them immediately, but whatever is held on the frame the menu closes
      * would otherwise leak straight through as a real button press. */
-    if (s_menu_open || scripted_input) input = 0;
+    if (s_menu_open || s_replay_open || scripted_input || !input_focus) input = 0;
     apply_frame_input(s_frames);
     apply_freezes();
     g_snes->input1_currentState |= input;
@@ -10219,6 +10158,7 @@ int main(int argc, char **argv) {
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
+  ScGamepadClose(&gamepad);
   SDL_Quit();
   ScRendererDestroy(&s_custom_renderer);
   write_pc_bitmap_dump();

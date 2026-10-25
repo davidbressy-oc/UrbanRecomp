@@ -50,6 +50,7 @@ endif()
 add_executable(UrbanRecomp
     src/main.c
     src/sc_launcher.c
+    src/sc_gamepad.c
     src/sc_sram.c
     src/sc_icon.c
     src/sc_mapview.c
@@ -225,7 +226,12 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    set(SC_RENDER_TESTS sc_renderer_test)
+    add_executable(sc_input_test tests/sc_input_test.c src/sc_gamepad.c src/sc_launcher.c)
+    target_include_directories(sc_input_test PRIVATE src ${SNESRECOMP_RUNNER_INCLUDE_DIRS})
+    snesrecomp_target_sdl(sc_input_test)
+    add_test(NAME simcity_input COMMAND sc_input_test ${CMAKE_CURRENT_BINARY_DIR}/sc-test-input.ini)
+    set_tests_properties(simcity_input PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1")
+    set(SC_RENDER_TESTS sc_renderer_test sc_input_test)
     if(EXISTS "${RECOMP_UI_ROOT}/src/recomp_launcher.h")
     add_executable(sc_video_test tests/sc_video_test.c src/sc_video.c src/sc_mods.c)
     target_include_directories(sc_video_test PRIVATE src ${RECOMP_UI_ROOT}/src)
@@ -393,6 +399,7 @@ if(SC_GEN_SOURCES)
     add_executable(UrbanRecompAOT EXCLUDE_FROM_ALL
         src/main.c
         src/sc_launcher.c
+        src/sc_gamepad.c
         src/sc_sram.c
         src/sc_icon.c
         src/sc_mapview.c

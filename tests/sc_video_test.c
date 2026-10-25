@@ -42,6 +42,28 @@ int main(int argc,char **argv) {
     assert(v.width==256 && v.height==532);
     s.aspect=SC_FIT_HEIGHT; v=ScVideoViewport(&s,3840,1080);
     assert(v.width==684 && v.height==224);
+    /* Absolute-pointer conversion: native limits are explicit even on 32:9.
+     * The output coordinate is wide, but false forbids a truncated WRAM write.
+     * Inputs are drawable pixels (window coordinates must be DPI-scaled first).
+     */
+    s.aspect=SC_32_9;
+    for (int centered=0; centered<2; ++centered) {
+        s.centered=centered; v=ScVideoViewport(&s,5120,1440);
+        ScVideoRect d=ScVideoDestination(v,5120,1440);
+        const int samples[][2]={{0,0},{255,223},{256,223},{683,223},{255,224},{-1,0}};
+        for (unsigned i=0;i<sizeof(samples)/sizeof(samples[0]);++i) {
+            int gx=samples[i][0], gy=samples[i][1], x,y;
+            double px=d.x+(gx+v.core_x+.5)*d.w/v.width;
+            double py=d.y+(gy+v.core_y+.5)*d.h/v.height;
+            bool valid=ScVideoToGuest(v,d,px,py,&x,&y);
+            assert(x==gx && y==gy);
+            assert(valid==(gx>=0 && gx<256 && gy>=0 && gy<224));
+            /* 150% Windows scaling, converted back to drawable pixels. */
+            assert(ScVideoToGuest(v,d,(px/1.5)*1.5,(py/1.5)*1.5,&x,&y)==valid);
+            assert(x==gx && y==gy);
+        }
+        assert(!ScVideoToGuest(v,(ScVideoRect){0,0,0,0},0,0,NULL,NULL));
+    }
     const RecompLauncherCModProvider *mods=ScModsProvider(&s,argv[1]);
     RecompLauncherCModFeature feature;
     assert(mods->feature_count(NULL)==1 && mods->feature_get(NULL,0,&feature));
