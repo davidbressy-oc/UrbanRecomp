@@ -55,6 +55,8 @@ void ScSettingsDefaults(ScSettings *s) {
   s->enable_audio = 1;
   s->widescreen = 1;
   s->sylt = 1;
+  s->player1_source = 1;
+  s->player1_deadzone = 15;
   /* The translation this project exists for, when it is there. */
   char blob[64], packets[64];
   translation_files(SC_LANG_GERMAN, blob, sizeof blob, packets, sizeof packets);
@@ -143,6 +145,9 @@ bool ScSettingsLoad(ScSettings *s, const char *path) {
     else if (!strcmp(key, "linear_filter")) s->linear_filter = atoi(val) != 0;
     else if (!strcmp(key, "enable_audio")) s->enable_audio = atoi(val) != 0;
     else if (!strcmp(key, "widescreen")) s->widescreen = atoi(val) != 0;
+    else if (!strcmp(key, "player1_source")) s->player1_source = clamp(atoi(val), 0, 2);
+    else if (!strcmp(key, "player1_deadzone")) s->player1_deadzone = clamp(atoi(val), 0, 100);
+    else if (!strcmp(key, "player1_guid")) snprintf(s->player1_guid, sizeof s->player1_guid, "%s", val);
     else if (!strcmp(key, "sylt")) s->sylt = atoi(val) != 0;
     else if (!strcmp(key, "language")) {
       for (int i = 0; i < SC_LANG_COUNT; i++)
@@ -163,10 +168,12 @@ bool ScSettingsSave(const ScSettings *s, const char *path) {
              "[Launcher]\nrom=%s\nskip_launcher=%d\n"
              "[Display]\nwindow_scale=%d\nfullscreen=%d\nlinear_filter=%d\nwidescreen=%d\n"
              "[Audio]\nenable_audio=%d\n"
-             "[Game]\nlanguage=%s\nsylt=%d\n",
+             "[Game]\nlanguage=%s\nsylt=%d\n"
+             "[Input]\nplayer1_source=%d\nplayer1_deadzone=%d\nplayer1_guid=%s\n",
           s->rom, s->skip_launcher, s->window_scale, s->fullscreen,
           s->linear_filter, s->widescreen, s->enable_audio,
-          kLanguageCodes[clamp(s->language, 0, SC_LANG_COUNT - 1)], s->sylt);
+          kLanguageCodes[clamp(s->language, 0, SC_LANG_COUNT - 1)], s->sylt,
+          s->player1_source, s->player1_deadzone, s->player1_guid);
   bool ok = fclose(f) == 0;
   if (ok) {
     remove(path);
@@ -466,7 +473,9 @@ int ScLauncherRun(ScSettings *s, const char *settings_path,
   io.volume = 100;
   io.language_index = s->language;
   io.skip_launcher = s->skip_launcher;
-  io.player_src[0] = 1;   /* keyboard */
+  io.player_src[0] = s->player1_source;
+  io.deadzone[0] = s->player1_deadzone;
+  snprintf(io.player_gamepad_guid[0], sizeof io.player_gamepad_guid[0], "%s", s->player1_guid);
 
 #if SNESRECOMP_SDL3
   const char *base = SDL_GetBasePath();
@@ -498,6 +507,9 @@ int ScLauncherRun(ScSettings *s, const char *settings_path,
   s->enable_audio = io.enable_audio != 0;
   s->language = clamp(io.language_index, 0, SC_LANG_COUNT - 1);
   s->skip_launcher = io.skip_launcher != 0;
+  s->player1_source = clamp(io.player_src[0], 0, 2);
+  s->player1_deadzone = clamp(io.deadzone[0], 0, 100);
+  snprintf(s->player1_guid, sizeof s->player1_guid, "%s", io.player_gamepad_guid[0]);
   if (!ScSettingsSave(s, settings_path))
     fprintf(stderr, "launcher: could not save %s\n", settings_path);
   return 1;

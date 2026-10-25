@@ -25,6 +25,9 @@ typedef struct ScSettings {
   int enable_audio;
   int widescreen;
   int language;            /* SC_LANG_* */
+  int player1_source;     /* 0 none, 1 keyboard, 2 gamepad */
+  int player1_deadzone;   /* percent */
+  char player1_guid[40];  /* persistent SDL identity, not an instance id */
   int sylt;                /* Sylt as the ninth scenario */
 } ScSettings;
 
